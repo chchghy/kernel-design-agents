@@ -26,9 +26,9 @@ ln -s "$(pwd)/skills/ncu-report-skill" ~/.claude/skills/ncu-report-skill
 ln -s "$(pwd)/skills/KernelWiki" ~/.claude/skills/KernelWiki
 
 # or clone skills directly
-# mkdir -p ~/.claude/skills && cd ~/.claude/skills
-# git clone https://github.com/DongyunZou/ncu-report-skill.git
-# git clone https://github.com/DongyunZou/KernelWiki.git
+mkdir -p ~/.claude/skills && cd ~/.claude/skills
+git clone https://github.com/mit-han-lab/ncu-report-skill.git
+git clone https://github.com/mit-han-lab/KernelWiki.git
 ```
 
 Install the `humanize` Claude Code plugin from the Claude Code plugin UI:
