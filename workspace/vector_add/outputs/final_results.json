@@ -1,0 +1,21 @@
+{
+  "task": "vector_add",
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "compute_capability": "9.0",
+  "theoretical_peak_bw_gbs": 3352.0,
+  "promoted_candidate": "float4",
+  "results_n_2e28": {
+    "baseline_latency_us": 1147.1,
+    "baseline_bw_gbs": 2808.3,
+    "float4_latency_us": 1040.6,
+    "float4_bw_gbs": 3095.5,
+    "improvement_pct": 10.2,
+    "pct_of_peak": 92.3
+  },
+  "sass_verified": true,
+  "vector_load_store": "LDG.E.128 / STG.E.128",
+  "register_spills": "none",
+  "ncu_profile": "blocked_by_permissions",
+  "benchmark_artifact": "benchmark.csv",
+  "candidates_artifact": "candidates.jsonl"
+}
