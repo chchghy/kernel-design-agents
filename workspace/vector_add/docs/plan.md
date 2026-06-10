@@ -1,68 +1,67 @@
-# Vector Add CUDA Kernel Optimization — Implementation Plan
+# H100 Vector Addition CUDA Kernel — Implementation Plan
 
 ## Goal Description
 
-Implement a high-performance element-wise vector addition CUDA kernel (`C[i] = A[i] + B[i]` for FP32 arrays of length N) targeting NVIDIA H100 (SM90). The kernel is purely memory-bound (0.083 FLOP/byte arithmetic intensity). The implementation includes a CPU reference validator, a progressive series of optimized kernel candidates, and an isolated CUDA-event benchmark harness. The primary metric is logical memory bandwidth: `3 * N * sizeof(float) / kernel_time`. The objective is to reach ≥60% of theoretical HBM3 peak bandwidth on H100 SXM5 (≥2.01 TB/s logical) while maintaining correct results within `1e-3` absolute tolerance across all edge-case sizes.
+Design and implement a high-performance, fully optimized element-wise vector addition CUDA kernel (`C[i] = A[i] + B[i]`) in FP32 for NVIDIA H100 (SM90). The kernel must achieve correct results within the task contract tolerance, outperform a fair baseline, and maximize memory bandwidth utilization — this is a deeply memory-bound kernel (0.083 FLOPs/byte arithmetic intensity) so the entire optimization strategy focuses on memory throughput rather than compute.
 
 ## Acceptance Criteria
 
 Following TDD philosophy, each criterion includes positive and negative tests for deterministic verification.
 
-- AC-1: Correctness — GPU output matches CPU reference.
+- AC-1: Correct element-wise FP32 vector addition for all tested N sizes.
   - Positive Tests (expected to PASS):
-    - N = 0: kernel is a no-op; validation passes trivially.
-    - N = 1, 2, 3, 4: small vectors; each element `|C_gpu[i] - C_cpu[i]| < 1e-3`.
-    - N = 1023, 1024, 1025: non-multiple-of-block, exact-block-multiple, and block-multiple-plus-one.
-    - N = 16,777,216 (64 MiB/array): medium size, full validation.
-    - N = 268,435,456 (1 GiB/array): large size, sampled validation (every 1000th element).
-    - N = 268,435,463 (1 GiB + 7): large non-multiple of 8, sampled validation.
+    - N = 2^28 (268,435,456): all elements match CPU reference within 1e-3 absolute tolerance. No NaN or inf values in output.
+    - N = 0: kernel returns immediately, no output written, no CUDA errors.
+    - N = 1, 127, 1023 (non-multiples of 4): scalar tail correctly handles remaining elements.
+    - Input data patterns: all zeros, all ones, alternating ±1, powers of two, uniform random [-1, 1], uniform random [-1000, 1000], values near FLT_MAX/2.
+    - All power-of-two N from 2^20 to 2^28.
   - Negative Tests (expected to FAIL):
-    - Introduce a NaN in input A (e.g. `NAN` constant); output must contain no NaN that wasn't in inputs — but standard addition propagates NaN, so this test confirms expected IEEE behavior. The actual rejection is: if output contains NaN where neither input had NaN, fail.
-    - Produce inf by using `FLT_MAX + FLT_MAX`; the test confirms inf output is correct (matches CPU), not rejected.
-  - AC-1.1: No silent NaN or inf generation.
-    - Positive: Verify `isfinite()` on every output element after addition of finite inputs.
-    - Negative: Inject `0.0f/0.0f` at element 0; confirm validation detects and reports the NaN.
-  - AC-1.2: All CUDA API calls succeed.
-    - Positive: Every `cudaMalloc`, `cudaMemcpy`, `cudaEvent*`, kernel launch returns `cudaSuccess`.
-    - Negative: Simulate an invalid launch config; confirm `cudaGetLastError()` catches it.
+    - A kernel that produces NaN or inf output for finite inputs is rejected.
+    - A kernel that passes N = 2^28 but fails N = 1023 (tail bug) is rejected.
+    - A kernel with any element exceeding 1e-3 absolute error is rejected.
+  - AC-1.1: Correctness stability across repeated runs.
+    - Positive: 5 consecutive validation runs all return PASS with consistent max error.
+    - Negative: Intermittent correctness failures (race conditions, out-of-bounds) cause rejection.
 
-- AC-2: Baseline kernel serves as a fair scalar reference.
-  - Positive Tests:
-    - Baseline uses grid-stride loop, `__restrict__`, 64-bit (`size_t`) indexing, and processes ≥4 elements per thread per iteration.
-    - Baseline compiles and validates correctly at all edge sizes.
-    - Baseline runs at ≥40% of detected platform peak bandwidth on large N.
-  - Negative Tests:
-    - A strawman single-element-per-thread kernel without `__restrict__` would show artificially low bandwidth; such a kernel must not be the baseline.
+- AC-2: Fair baseline kernel that represents a competent starting point (not a strawman).
+  - Positive Tests (expected to PASS):
+    - Baseline uses: grid-stride loop, `const float* __restrict__` on inputs, `float* __restrict__` on output, `size_t` indexing, 256 or 512 threads/block.
+    - Baseline compiles and passes all AC-1 tests.
+    - Baseline benchmark produces stable, reproducible median latency at N = 2^28 (IQR < 10% of median).
+  - Negative Tests (expected to FAIL):
+    - A "naive" kernel without grid-stride or `__restrict__` is rejected as baseline — it misrepresents what a reasonable developer would write.
+    - A baseline that uses `int` indexing and overflows at N = 2^28 is rejected.
 
-- AC-3: Optimized kernel candidates show genuine hardware utilization improvement.
-  - Positive Tests:
-    - Candidate 1 (float4 vectorization) passes all correctness checks, including tail for non-multiple-of-4 N.
-    - At least one candidate produces median logical bandwidth within 5% of the best-measured candidate.
-    - The best candidate achieves ≥60% of theoretical HBM3 peak on detected H100 SXM5.
-  - Negative Tests:
-    - A candidate with register spills (detected via `-Xptxas -v` showing local memory usage) must be marked as degraded.
-    - A candidate that produces `cudaErrorIllegalAddress` on edge sizes must be rejected.
-  - AC-3.1: Cache-policy candidate is gated.
-    - Positive: Compiles only under `__CUDA_ARCH__ >= 900`; produces `ld.global.L1::no_allocate` in SASS (verified via Nsight Compute or `cuobjdump`).
-    - Negative: Fails to compile on sm_80 or lower hardware (expected and acceptable).
+- AC-3: At least one candidate kernel measurably outperforms the baseline.
+  - Positive Tests (expected to PASS):
+    - Candidate median bandwidth exceeds baseline median bandwidth, with the improvement direction confirmed across the power-of-two N sweep (2^20 through 2^28).
+    - The improvement is visible at large N (>= 2^26) where kernel launch overhead is amortized.
+  - Negative Tests (expected to FAIL):
+    - A candidate that regresses at any tested N compared to baseline is investigated; persistent regressions at N >= 2^26 block promotion.
+    - A candidate whose bandwidth improvement is smaller than the timing noise band (IQR overlap) is treated as "noise-level" and not promoted on performance grounds alone.
 
-- AC-4: Benchmark harness provides reliable, isolated kernel timing.
-  - Positive Tests:
-    - Benchmark uses `cudaEvent_t` with `cudaEventCreate`/`cudaEventRecord`/`cudaEventSynchronize`/`cudaEventElapsedTime` for isolated kernel timing.
-    - All allocations, host-device copies, and validation are outside the timed region.
-    - Warmup iterations (≥10) are run before timed iterations (≥100).
-    - Results include min, median, and standard deviation across timed iterations.
-    - Logical bandwidth is computed as `3.0 * N * sizeof(float) / median_time_seconds / 1e9` (GB/s).
-  - Negative Tests:
-    - Timing that includes `cudaMemcpy` or `cudaDeviceSynchronize` inside the iteration loop would inflate reported time; harness must not do this.
-    - Timing on N smaller than L2 cache size (50 MB) conflates cache bandwidth with DRAM bandwidth; harness must warn or reject.
+- AC-4: Reliable benchmark harness with proper GPU timing methodology.
+  - Positive Tests (expected to PASS):
+    - Uses CUDA events (`cudaEventRecord`, `cudaEventSynchronize`, `cudaEventElapsedTime`).
+    - Calls `cudaGetLastError()` and `cudaDeviceSynchronize()` after every kernel launch.
+    - Runs 10 warm-up iterations + 50 timed iterations; reports trimmed mean (discard top/bottom 20%), median, and IQR.
+    - Computes effective bandwidth as `3 * N * sizeof(float) / latency_median` bytes/second.
+    - Prints H100 device identification via `cudaGetDeviceProperties` (device name, compute capability, theoretical memory bandwidth).
+    - Appends structured results to `benchmark.csv`.
+  - Negative Tests (expected to FAIL):
+    - Harness without CUDA event synchronization is rejected (wall-clock timing includes launch overhead).
+    - Harness without error checking after kernel launch is rejected.
+    - Harness that does not report variance/IQR is rejected.
 
-- AC-5: Device-conditional reporting.
-  - Positive Tests:
-    - On detected H100 SXM5 (device name contains "H100", memory bus width ≥ 5120 bits, computed peak BW ≥ 3000 GB/s): target 2.01 TB/s logical bandwidth.
-    - On non-H100 or H100 PCIe: report achieved bandwidth as fraction of detected platform peak. No absolute pass/fail.
-  - Negative Tests:
-    - Hard-coded "3.35 TB/s" without runtime verification would give misleading percentages on non-SXM hardware.
+- AC-5: Architecture evidence for the final promoted candidate.
+  - Positive Tests (expected to PASS):
+    - SASS inspection (`cuobjdump -sass`) confirms vectorized load/store instructions (LDG.128 / STG.128 for float4 paths).
+    - SASS confirms no local memory spills (no LDL/STL to stack) in the promoted candidate.
+    - Nsight Compute metrics recorded: DRAM throughput, L2 throughput, achieved occupancy, register count, global load/store efficiency.
+    - Candidate metadata recorded in `candidates.jsonl` with: name, parent, block_size, vector_width, latency_median_us, bandwidth_median_gbs, correctness, promotion_decision.
+  - Negative Tests (expected to FAIL):
+    - A candidate promoted without SASS verification is blocked — unexpected instruction lowering (e.g., scalarized float4) invalidates performance claims.
+    - A candidate with register spills (STL/LDL detected in SASS) requires investigation before promotion.
 
 ## Path Boundaries
 
@@ -70,18 +69,38 @@ Path boundaries define the acceptable range of implementation quality and choice
 
 ### Upper Bound (Maximum Acceptable Scope)
 
-The implementation includes a single `vector_add.cu` file (~400–600 lines) containing: a CPU reference implementation, a grid-stride scalar baseline kernel with `__restrict__` and 64-bit indexing, a float4-vectorized kernel, an experimental cache-policy kernel gated behind `__CUDA_ARCH__ >= 900`, an ILP-2x float4 kernel, a block-size tunable variant, a runtime device-properties query and bandwidth computation, CLI argument parsing for `--validate`/`--benchmark`/`--size`/`--kernel`, CUDA event-based isolated timing with min/median/stddev reporting, comprehensive edge-case tests including N=0, and templated kernel dispatch functions. All candidates that pass correctness are benchmarked and results recorded. No external dependencies beyond the CUDA runtime and standard C++ library.
+A single `vector_add.cu` file (under 600 lines) containing:
+- CPU reference implementation
+- CLI-driven validation and benchmark harness with CUDA event timing
+- 6 candidate kernels as separate `__global__` functions:
+  1. `baseline`: grid-stride scalar with `__restrict__` and `size_t`
+  2. `float2`: 2 elements per thread via `float2` loads/stores
+  3. `float4`: 4 elements per thread via `float4` loads/stores (primary candidate)
+  4. `ilp2x`: 8 elements per thread via two `float4` operations per iteration
+  5. `cache_hint`: float4 with L1::no_allocate PTX inline assembly (experimental, `#ifdef USE_PTX_CACHE_HINTS` gated, with pure CUDA fallback)
+  6. `block_sweep`: float4 kernel templated on `blockDim` for block size sweep {128, 256, 512, 1024}
+- Alignment-aware dispatch: check 16-byte alignment of all three pointers; fall back to scalar path if any are misaligned
+- Scalar tail loop for `N % vector_width` remaining elements
+- Multi-N benchmark sweep (2^20 through 2^28)
+- SASS dump and Nsight Compute profiling for the final promoted candidate
+- Artifact output to `benchmark.csv` and `candidates.jsonl`
+- `-maxrregcount` experiment as a separate build variant (not compiled into the default binary)
 
 ### Lower Bound (Minimum Acceptable Scope)
 
-The implementation includes a single `vector_add.cu` file with: a CPU reference, a grid-stride scalar baseline kernel, a float4-vectorized kernel, correctness validation against CPU reference at N=16M and N=256M, CUDA event-based isolated timing reporting average and median bandwidth, and a working compile/run cycle via `nvcc -O2 -std=c++17 -arch=sm_90 -lineinfo vector_add.cu -o vector_add && ./vector_add --benchmark --size 268435456`. At minimum, the float4 kernel must pass all correctness checks.
+A single `vector_add.cu` file containing:
+- CPU reference implementation
+- CLI harness with PASS/FAIL output and `--benchmark` mode
+- `baseline` kernel (grid-stride, `__restrict__`, `size_t`)
+- `float4` candidate kernel with alignment check and scalar tail
+- Correctness validation at N = 2^28 (all power-of-two sizes from 2^20 to 2^28 strongly preferred)
+- Benchmark with CUDA events, warm-up + timed iterations, median + IQR reporting
+- `benchmark.csv` recording for baseline and float4 candidate
 
 ### Allowed Choices
 
-- Can use: CUDA C++ with runtime API, PTX inline assembly for cache-policy hints (architecture-gated), `float4` vectorized loads/stores, grid-stride loop pattern, `__launch_bounds__`, `__restrict__`, CUDA events for timing, `size_t`/`uint64_t` for all indices, runtime device property queries, templated kernel dispatch with function pointers.
-- Cannot use: Third-party libraries (cuBLAS, CUTLASS, Thrust), `cuda::memcpy_async`/`cp.async` (no shared-memory staging needed for this streaming pattern), cooperative groups, TMA (overkill for a 1D streaming op), dynamic parallelism, CUDA graphs.
-
-> The draft specifies a deterministic design: single-file CUDA implementation with progressive optimization candidates evaluated via isolated benchmarks. The path boundaries reflect this specification — the implementation is self-contained within one `.cu` file with no external library dependencies.
+- Can use: `float2`/`float4` vectorized types, `__restrict__` qualifiers, grid-stride loops, `constexpr` block sizes, `__launch_bounds__`, PTX inline assembly (experimental only, with CUDA C++ fallback), `-maxrregcount` (as build variant), `cuobjdump` for SASS inspection, Nsight Compute for profiling
+- Cannot use: third-party libraries (cuBLAS, CUTLASS, Thrust), tensor cores (no `wgmma`/`tcgen05`), TMA (`cuda::memcpy_async`), cooperative groups, dynamic parallelism, CUDA graphs, `cudaMallocManaged`, unified memory
 
 ## Feasibility Hints and Suggestions
 
@@ -89,87 +108,82 @@ The implementation includes a single `vector_add.cu` file with: a CPU reference,
 
 ### Conceptual Approach
 
-The kernel is purely memory-bound. The optimization strategy follows a progression:
+The implementation follows a single-file design with all kernels in one translation unit, dispatched from a CLI harness:
 
 ```
-Baseline (grid-stride scalar + __restrict__)
-  → float4 vectorization (128-bit loads/stores, 4 elements/thread/iter)
-    → [optional] L1 cache bypass via PTX (#if __CUDA_ARCH__ >= 900)
-      → [optional] 2× float4 ILP (8 elements/thread/iter)
-        → block-size tuning
+vector_add.cu
+├── CPU reference:    void vector_add_cpu(const float*, const float*, float*, size_t)
+├── Validation:       bool validate(const float*, const float*, size_t, float max_err)
+├── Benchmark:        void benchmark(kernel_fn, config, benchmark_result&)
+├── Baseline kernel:  __global__ void baseline(...)
+├── float4 kernel:    __global__ void float4_add(...)
+├── float2 kernel:    __global__ void float2_add(...)
+├── ilp2x kernel:     __global__ void ilp2x_add(...)
+├── cache_hint kernel: __global__ void cache_hint_add(...)
+├── block_sweep:      template<int BLOCK> __global__ void float4_templated(...)
+├── main():           parse --benchmark / --candidate / --validate flags, dispatch, report
+└── device_info():    print cudaGetDeviceProperties for SKU identification
 ```
 
-Each candidate is a separate templated kernel instantiation, selectable at runtime.
-
-**Grid-stride loop pattern** (used by all candidates):
-
-```cuda
-template<int VectorWidth, bool UseCacheHints>
-__global__ void vector_add_kernel(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float* __restrict__ C,
-    size_t N)
-{
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = gridDim.x * blockDim.x;
-    // Each thread processes VectorWidth elements per iteration
-    size_t elem_idx = idx * VectorWidth;
-    while (elem_idx + VectorWidth <= N) {
-        // ... vectorized load, add, store ...
-        elem_idx += stride * VectorWidth;
-    }
-    // Tail handling for remaining < VectorWidth elements
-}
-```
-
-**float4 load/store:** Use `reinterpret_cast<const float4*>` for aligned access. `cudaMalloc` guarantees 256-byte alignment, satisfying float4's 16-byte requirement.
-
-**Cache policy (experimental):** PTX inline asm with `ld.global.L1::no_allocate.v4.f32` replaces the float4 load. Only enabled when `__CUDA_ARCH__ >= 900`. This is a measured optimization — if Nsight Compute profiling shows no improvement or SASS regresses, it should be rejected.
-
-**ILP (2× float4):** Load two float4 values from A, then two from B, before computing. This increases memory-level parallelism. Requires ~16 extra registers; must verify no spilling with `-Xptxas -v`.
-
-**Block size tuning:** Test 128, 256, 512, 1024 threads/block. On H100: 256 or 512 typically works best for memory-bound kernels. Keep the simplest block size within 2% of the best-measured.
+Key design patterns:
+- All kernels use `const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, size_t N`.
+- Grid calculation: `size_t total_threads = (N + elems_per_thread - 1) / elems_per_thread; size_t blocks = (total_threads + blockDim - 1) / blockDim;`
+- Vectorized kernels compute `size_t idx = blockIdx.x * blockDim.x + threadIdx.x` (in float4 units), then `size_t base = idx * 4`. The main loop processes full float4 chunks; a tail handles `N % 4`.
+- Alignment check: `uintptr_t ptr_a = reinterpret_cast<uintptr_t>(A); bool aligned = (ptr_a % 16 == 0) && (ptr_b % 16 == 0) && (ptr_c % 16 == 0);`
+- Benchmark harness: `cudaEventRecord(start)`, kernel launch, `cudaEventRecord(stop)`, `cudaEventSynchronize(stop)`, `cudaEventElapsedTime(&ms, start, stop)`.
+- H100 SKU detection: `cudaDeviceProp prop; cudaGetDeviceProperties(&prop, 0);` — record `prop.name`, `prop.major.minor`, theoretical bandwidth from `prop.memoryClockRate * prop.memoryBusWidth / 8`.
 
 ### Relevant References
 
-- `/softhome/gehongyu/kernel-design-agents/skills/ncu-report-skill/helpers/harness_template.cu` — CUDA profiling harness template with CUDA_CHECK, alloc_device, CLI parsing, and synthetic data fill helpers.
-- `/softhome/gehongyu/kernel-design-agents/skills/ncu-report-skill/helpers/safetensors_loader.h` — Header-only safetensors file reader (not needed for synthetic data benchmarks).
-- KernelWiki `technique-vectorized-loads` — Wide vectorized loads (128-bit, 256-bit) and cache-policy differentiation for memory-bound kernels on Hopper/Blackwell.
-- KernelWiki `technique-cache-policy` — PTX load cache qualifiers: `L1::no_allocate` for streaming data, `L1::evict_last` for reused data.
+- `~/kernel-design-agents/skills/KernelWiki/wiki/techniques/vectorized-loads.md` — 128/256-bit load PTX, cache policy differentiation patterns
+- `~/kernel-design-agents/skills/KernelWiki/wiki/patterns/memory-bound.md` — memory-bound kernel optimization checklist and caveats
+- `~/kernel-design-agents/skills/ncu-report-skill/helpers/harness_template.cu` — CUDA profiling harness template with `CUDA_CHECK` macro and alloc patterns
+- H100 whitepaper: 3,352 GB/s peak HBM3 bandwidth (SXM5), 132 SMs, 50 MB L2
+- CUDA 13.1 Programming Guide: SM90 architecture, `__launch_bounds__`, PTX ISA reference for `ld.global.L1::no_allocate`
 
 ## Dependencies and Sequence
 
 ### Milestones
 
-1. Milestone M1: Harness infrastructure and baseline kernel.
-   - Phase A: Write `vector_add.cu` with CUDA_CHECK, CPU reference, CLI parsing (`--validate`, `--benchmark`, `--size`, `--kernel`).
-   - Phase B: Implement the grid-stride scalar baseline kernel with `__restrict__`, `size_t` indexing, and `__launch_bounds__`.
-   - Phase C: Implement validation logic (full and sampled comparison with CPU reference, NaN/inf detection).
-   - Phase D: Implement CUDA event-based benchmark harness (warmup, timed iterations, min/median/stddev, logical bandwidth computation).
-   - Phase E: Add runtime device info printing and peak bandwidth computation.
+1. **M1: Unified Harness** — Create `vector_add.cu` with CPU reference, CLI (--validate / --benchmark / --candidate), CUDA event timing, error checking macros, device info printing.
+   - Phase A: Implement CPU reference `vector_add_cpu()` with element-wise FP32 add.
+   - Phase B: Implement CLI framework using `argc/argv` parsing.
+   - Phase C: Implement `benchmark()` function with CUDA events, warm-up + timed iterations, trimmed mean statistics.
+   - Phase D: Implement `validate()` function comparing GPU output against CPU reference with 1e-3 tolerance.
+   - Phase E: Implement `device_info()` printing `cudaGetDeviceProperties` data.
 
-2. Milestone M2: float4 vectorized kernel candidate.
-   - Step 1: Implement templated vector_add kernel with `VectorWidth=4`, scalar loads.
-   - Step 2: Replace scalar loads with `reinterpret_cast<const float4*>` and float4 stores.
-   - Step 3: Add tail handling: scalar prologue for start alignment, float4 main loop, scalar epilogue for remaining < 4 elements.
-   - Step 4: Validate at all edge sizes (N=0..7, 1023..1025, 16M, 16M+1, 256M, 256M+7).
+2. **M2: Baseline Kernel + Validation** — Implement and validate the baseline kernel.
+   - Step 1: Write `baseline` kernel: grid-stride loop, `__restrict__`, `size_t`.
+   - Step 2: Run validation at all power-of-two N from 2^20 to 2^28.
+   - Step 3: Run benchmark at N = 2^28, record baseline performance in `benchmark.csv`.
+   - Depends on: M1.
 
-3. Milestone M3: Cache-policy candidate (experimental).
-   - Step 1: Add PTX inline asm for `ld.global.L1::no_allocate.v4.f32` on A and B loads, gated behind `#if __CUDA_ARCH__ >= 900`.
-   - Step 2: Provide scalar fallback path for non-H100 compilation.
-   - Step 3: Benchmark; if < 3% improvement over float4 or SASS inspection shows regression, mark as rejected.
+3. **M3: float4 Candidate** — Primary vectorized candidate with alignment handling.
+   - Step 1: Write `float4_add` kernel with `float4` loads/stores.
+   - Step 2: Implement alignment check at dispatch: if any pointer is not 16-byte aligned, fall back to baseline.
+   - Step 3: Implement scalar tail for `N % 4 != 0`.
+   - Step 4: Validate correctness at all power-of-two N + irregular N (127, 1023).
+   - Step 5: Benchmark at all power-of-two N, record in `benchmark.csv` and `candidates.jsonl`.
+   - Depends on: M2.
 
-4. Milestone M4: ILP-2x and block-size tuning.
-   - Step 1: Implement 2× float4 per iteration (VectorWidth=8).
-   - Step 2: Check register usage with `-Xptxas -v`; if spills detected, note the degradation.
-   - Step 3: Test block sizes 128, 256, 512, 1024 with the best-so-far kernel.
-   - Step 4: Select simplest block within 2% of best; only add `__launch_bounds__` if reproducible > 2% win.
+4. **M4: Additional Candidates** — float2, ILP-2x, and comparative analysis.
+   - Step 1: Write `float2_add` kernel.
+   - Step 2: Write `ilp2x_add` kernel (two float4 per thread per iteration).
+   - Step 3: Benchmark all candidates, identify top performer.
+   - Depends on: M3.
 
-5. Milestone M5: Final benchmarking and result recording.
-   - Step 1: Run full benchmark suite across all accepted candidates at N=256M.
-   - Step 2: Record results with device info, kernel variant, block size, min/median/stddev time, logical GB/s, and percent of platform peak.
-   - Step 3: Document which candidates were accepted, revised, or rejected, with rationale.
+5. **M5: Tuning Experiments** — Block size sweep, register budget, cache hints.
+   - Step 1: Write `float4_templated<BLOCK>` and benchmark {128, 256, 512, 1024}.
+   - Step 2: Build with `-maxrregcount={32,40,48,56,64}` and benchmark best block size.
+   - Step 3: Write `cache_hint_add` kernel (PTX `L1::no_allocate`, `#ifdef USE_PTX_CACHE_HINTS` gated) and compare against float4.
+   - Depends on: M4.
+
+6. **M6: Final Candidate Promotion** — SASS/PTX inspection, Nsight profiling, promotion decision.
+   - Step 1: Run `cuobjdump -sass vector_add` on the best candidate; verify LDG.128/STG.128, no STL/LDL spills.
+   - Step 2: Run Nsight Compute with metrics: `dram__throughput`, `l1tex__throughput`, `sm__throughput`, `achieved_occupancy`, register count, global load/store efficiency.
+   - Step 3: Select promoted candidate, update `candidates.jsonl` with promotion decision.
+   - Step 4: Record final results in `benchmark.csv`.
+   - Depends on: M5.
 
 ## Task Breakdown
 
@@ -179,353 +193,313 @@ Each task must include exactly one routing tag:
 
 | Task ID | Description | Target AC | Tag | Depends On |
 |---------|-------------|-----------|-----|------------|
-| task-harness | Write vector_add.cu harness: CUDA_CHECK, CPU reference, CLI parsing, device info query, validation, and CUDA event benchmark infrastructure | AC-4, AC-5 | coding | - |
-| task-baseline | Implement grid-stride scalar baseline kernel with __restrict__, size_t indexing, and 4-elem/thread unrolling | AC-1, AC-2 | coding | task-harness |
-| task-baseline-validate | Validate baseline: compile, run all edge sizes, verify correctness, record baseline bandwidth | AC-1, AC-2 | coding | task-baseline |
-| task-float4 | Implement float4-vectorized kernel with tail handling (prologue/main/epilogue) | AC-1, AC-3 | coding | task-baseline-validate |
-| task-float4-validate | Validate and benchmark float4 kernel at all edge sizes; compare against baseline | AC-1, AC-3 | coding | task-float4 |
-| task-cache-policy | Implement cache-policy kernel with PTX L1::no_allocate, gated behind #if __CUDA_ARCH__ >= 900 | AC-1, AC-3.1 | coding | task-float4-validate |
-| task-cache-validate | Validate and benchmark cache-policy kernel; inspect SASS if H100 available; accept or reject | AC-1, AC-3.1 | coding | task-cache-policy |
-| task-ilp2x | Implement ILP-2x float4 kernel with register-spill check | AC-1, AC-3 | coding | task-float4-validate |
-| task-ilp2x-validate | Validate, benchmark, and check register usage of ILP-2x kernel | AC-1, AC-3 | coding | task-ilp2x |
-| task-tune-blocks | Test block sizes 128/256/512/1024 on best kernel; select simplest within 2% of best | AC-3 | coding | task-float4-validate |
-| task-final-benchmark | Run full benchmark suite on all accepted candidates at N=256M; record comprehensive results | AC-3, AC-4, AC-5 | coding | task-cache-validate, task-ilp2x-validate, task-tune-blocks |
-| task-assess-plan | After implementation, assess whether plan acceptance criteria are satisfied and recommend promotion/next steps | AC-1 through AC-5 | analyze | task-final-benchmark |
+| task-harness | Create unified `vector_add.cu` with CPU reference, CLI, CUDA event timing, error checking, device info, benchmark stats | AC-4 | coding | - |
+| task-baseline | Implement `baseline` kernel (grid-stride, `__restrict__`, `size_t`) and validate at all power-of-two N | AC-1, AC-2 | coding | task-harness |
+| task-float4 | Implement `float4_add` kernel with alignment check and scalar tail; validate and benchmark | AC-1, AC-3 | coding | task-baseline |
+| task-float2 | Implement `float2_add` kernel and benchmark vs baseline | AC-3 | coding | task-float4 |
+| task-ilp2x | Implement `ilp2x_add` kernel (2x float4 per thread) and benchmark | AC-3 | coding | task-float4 |
+| task-block-sweep | Implement templated `float4_templated<BLOCK>` and benchmark {128,256,512,1024} | AC-3 | coding | task-float4 |
+| task-reg-sweep | Build with `-maxrregcount={32,40,48,56,64}`, benchmark best block size variant | AC-3 | coding | task-block-sweep |
+| task-cache-hint | Implement `cache_hint_add` kernel (PTX L1::no_allocate, `#ifdef` gated with CUDA fallback) | AC-3 | coding | task-float4 |
+| task-benchmark-all | Run full multi-N sweep for all candidates, record in benchmark.csv and candidates.jsonl | AC-3, AC-4 | coding | task-float2, task-ilp2x, task-block-sweep, task-reg-sweep, task-cache-hint |
+| task-sass-inspect | Run `cuobjdump -sass` on promoted candidate; verify LDG.128/STG.128 and no spills | AC-5 | coding | task-benchmark-all |
+| task-ncu-profile | Run Nsight Compute on promoted candidate; record DRAM/L2/occupancy metrics | AC-5 | coding | task-benchmark-all |
+| task-codex-review | Codex final review: assess candidate ranking, verify promotion rationale, check benchmark methodology | AC-3, AC-4, AC-5 | analyze | task-ncu-profile, task-sass-inspect |
 
 ## Claude-Codex Deliberation
 
 ### Agreements
-- 64-bit (`size_t`/`uint64_t`) indexing is mandatory for correctness with large N.
-- A grid-stride scalar baseline with `__restrict__` and unrolling is the correct fair reference, not a single-element-per-thread strawman.
-- `cp.async`/cooperative-groups adds complexity with no benefit for a streaming global-to-global operation — rejected upfront.
-- CUDA event timing with warmup, isolated kernel measurement, and min/median/stddev reporting is the correct benchmarking discipline.
-- float4 alignment is satisfied by `cudaMalloc` (256-byte alignment), but tail handling for non-multiple-of-4 N is required.
-- N=0 must be handled as a no-op before any kernel launch.
-- Cache-policy PTX must be gated behind `__CUDA_ARCH__ >= 900` with a scalar fallback.
-- Bandwidth metric is logical: `3 * N * sizeof(float) / kernel_time`. Actual DRAM bytes may differ slightly due to sector inefficiency.
-- The 60%-of-peak bandwidth target is conditional on detected H100 SXM5 hardware.
+
+- Baseline should be a fair grid-stride kernel with `__restrict__` and `size_t`, not a naive single-element strawman.
+- Multi-N benchmark sweep (2^20 to 2^28) is essential for meaningful performance comparison; single N=2^28 can hide tail behavior and launch overhead.
+- float4 vectorized loads/stores is the primary optimization lever; all other candidates are secondary refinements.
+- Benchmark.csv and candidates.jsonl recording is required per the KDA workflow.
+- Edge case handling (N=0, non-multiples of vector width, scalar tails) must be explicit and tested.
+- Occupancy should not be a rigid promotion criterion on its own — it is an enabler, not a goal.
+- SASS/PTX inspection for the final promoted candidate is necessary to verify emitted instruction quality.
+- L1 cache policy hints via inline PTX are experimental and must be gated behind `#ifdef`, with a pure CUDA C++ fallback.
+- H100 SXM vs PCIe distinction matters for performance targets; device SKU must be recorded at benchmark time.
+- Store policy (streaming vs. write-back) is a valid optimization dimension; default write-back is correct for the host-readback pipeline.
 
 ### Resolved Disagreements
-- **Promotion requiring improvement over baseline**: Claude originally proposed "at least one candidate must improve over baseline." Codex objected that a competent scalar baseline may already be near-optimal, making this an unreasonable gate. Resolution: Baseline is a reference; candidates are judged by absolute bandwidth. No candidate is required to exceed baseline. All results are recorded objectively.
-- **Cache-policy acceptance metric**: Claude originally used "lower DRAM traffic" as the acceptance test for L1 cache policy. Codex correctly noted that `L1::no_allocate` does not reduce logical bytes read/written — it affects cache allocation behavior. Resolution: Cache-policy candidate requires SASS inspection confirming intended `ld.global.L1::no_allocate` instructions AND ≥3% median improvement over float4-only. If not met, reject.
-- **H100 SXM5 detection rule**: Claude's initial "SMs >= 128 && peak BW >= 3000 GB/s" was too loose. Codex required device name matching. Resolution: Detection uses device name containing "H100" AND memory bus width ≥ 5120 bits AND computed peak BW ≥ 3000 GB/s. Non-H100 falls back to platform-relative reporting.
-- **Peak bandwidth formula**: Codex noted the initial formula omitted kHz→Hz unit conversion. Resolution: `peak_GBps = 2.0 * memoryClockRate_kHz * 1000.0 * (memoryBusWidth_bits / 8.0) / 1e9`.
-- **Compile target**: Codex noted `-arch=sm_90` conflicts with the portability fallback story. Resolution: The binary is explicitly H100/sm_90. The `#if __CUDA_ARCH__ >= 900` guard is compile-time safety, not a deployment target — the kernel is only validated on H100.
+
+- **float4 impact magnitude**: Claude originally expected 1.5-2x gain; Codex noted scalar loads already coalesce at warp level. Resolved: float4 impact is measured, not assumed. The promotion criterion is measured improvement, not a preset multiplier.
+- **Inline PTX scope**: Claude favored PTX as a standard candidate; Codex preferred pure CUDA C++ unless PTX proves necessary. Resolved: PTX is experimental only, `#ifdef` gated, with mandatory CUDA fallback and SASS verification.
+- **ILP-2x benefit**: Claude thought it may help; Codex was skeptical. Resolved: ILP-2x is a separate candidate measured against float4; if no improvement, it is rejected.
+- **Promotion threshold**: Claude initially said "clear improvement"; Codex requested a specific threshold. Resolved per user decision: >5% median bandwidth improvement is a guideline; candidates with smaller but consistent improvement can still be promoted with evidence.
+- **Nsight Compute timing**: Claude suggested final candidate only; Codex preferred per-candidate profiling. Resolved: Nsight runs on the promoted candidate; per-candidate profiling is deferred to keep the candidate loop fast.
+- **AC-1 tolerance standard**: Claude initially had dual "bit-exact" and "1e-3 tolerance" language. Resolved per user decision: 1e-3 absolute tolerance is the hard correctness gate; bit-exact match for normal finite values is a desirable property but not a separate gate.
+- **Candidate count**: Claude listed 6 candidates but enumerated 7 (baseline + float2 + float4 + ilp2x + cache_hint + block_sweep + reg_sweep). Resolved: 7 distinct candidates, counted as 7.
 
 ### Convergence Status
+
 - Final Status: `converged`
-- Rounds executed: 2
-- All REQUIRED_CHANGES resolved across both rounds.
-- No material disagreements remain.
+- Convergence rounds: 2 (Codex v1 analysis + 2 Codex review rounds)
+- Second Codex review: CONVERGED, zero REQUIRED_CHANGES, zero UNRESOLVED
 
 ## Pending User Decisions
 
-- DEC-1: KDA benchmarking exercise vs. production-quality kernel?
-  - Claude Position: Assume benchmarking exercise. Multiple candidates with experimental techniques (PTX cache hints, ILP variants) and runtime kernel selection are appropriate. The goal is to demonstrate optimization methodology and measure each technique's contribution.
-  - Codex Position: N/A — agrees with Claude's assessment but asks for explicit confirmation.
-  - Tradeoff Summary: A benchmarking exercise justifies keeping experimental candidates in the code even if some are rejected. A production kernel would strip all but the single best variant and remove PTX fragility.
-  - Decision Status: `PENDING`
+All user decisions have been resolved through the gen-plan process:
 
-- DEC-2: Is H100 SXM5 guaranteed for benchmark evaluation?
-  - Claude Position: Assume no — plan for device-conditional reporting. The code detects hardware at runtime and adjusts targets accordingly. If H100 is available, use the 2.01 TB/s target. If not, report platform-relative results.
-  - Codex Position: N/A — agrees with the conditional approach but asks for explicit confirmation.
-  - Tradeoff Summary: If H100 SXM5 is guaranteed, the 2.01 TB/s target can be treated as a hard promotion gate. If not, the plan's conditional approach is correct and no code changes are needed.
-  - Decision Status: `PENDING`
+- DEC-1: Promotion performance threshold (>5% improvement)
+  - Claude Position: >5% median bandwidth improvement at N >= 2^26 as a guideline
+  - Codex Position: Specific numeric threshold to eliminate noise-level promotions
+  - User Decision: Guideline/direction — candidates with smaller improvement can be promoted with evidence
+  - Decision Status: RESOLVED
 
-- DEC-3: Runtime kernel selection vs. compile-time variants?
-  - Claude Position: Use runtime selection via CLI `--kernel` flag and templated function pointer dispatch. This enables side-by-side benchmarking in a single binary.
-  - Codex Position: Agrees runtime selection is fine for a benchmark exercise. Notes that compile-time `#define` would produce smaller binaries but is less convenient for comparison.
-  - Tradeoff Summary: Runtime selection is slightly more complex but allows single-binary comparison. Compile-time variants are simpler but require multiple compilations for comparison. For this exercise, runtime is preferred.
-  - Decision Status: `PENDING`
+- DEC-2: Expected throughput target (2,500-2,900 GB/s)
+  - Claude Position: Expected outcome range based on theoretical analysis
+  - Codex Position: Must account for SXM vs PCIe distinction
+  - User Decision: Hard requirement — for H100 SXM5; adjusted proportionally for other SKUs
+  - Decision Status: RESOLVED
+
+- DEC-3: Correctness tolerance (1e-3 absolute error)
+  - Claude Position: 1e-3 is the task contract tolerance; bit-exact desirable for normal values
+  - Codex Position: FP32 add should be bit-exact with same operation order
+  - User Decision: 1e-3 is the hard correctness gate
+  - Decision Status: RESOLVED
+
+- DEC-4: Benchmark N size sweep
+  - Claude Position: Multi-N sweep from 2^20 to 2^28
+  - Codex Position: Include non-power-of-two sizes for tail coverage
+  - User Decision: Power-of-two sweep (2^20 through 2^28)
+  - Decision Status: RESOLVED
 
 ## Implementation Notes
 
 ### Code Style Requirements
+
 - Implementation code and comments must NOT contain plan-specific terminology such as "AC-", "Milestone", "Step", "Phase", or similar workflow markers.
 - These terms are for plan documentation only, not for the resulting codebase.
 - Use descriptive, domain-appropriate naming in code instead.
-- Use English for all code, comments, and commit messages per repository rules.
-- Follow the naming conventions in the harness template: `CUDA_CHECK` macro, `alloc_device<T>` helper, `fill_f32_random` for synthetic data.
-- Keep the implementation in a single file: `vector_add.cu`.
+- All code, comments, and documentation must be in English.
+- Unified single-file implementation: `vector_add.cu`.
+
+### Benchmark Artifact Schema
+
+**benchmark.csv** columns:
+```
+candidate_name,N,block_size,vector_width,elems_per_thread,iter_warmup,iter_timed,latency_median_us,latency_iqr_us,bandwidth_median_gbs,device_name,compute_capability,theoretical_bw_gbs,compiler_flags,correctness_result,timestamp_utc
+```
+
+**candidates.jsonl** schema (one JSON object per line):
+```json
+{"name":"baseline","parent":null,"status":"baseline","block_size":256,"vector_width":1,"elems_per_thread":1,"latency_median_us":1234.5,"bandwidth_median_gbs":2100.0,"correctness":"PASS","promotion_decision":"baseline_reference","notes":"","timestamp_utc":"2026-06-10T00:00:00Z"}
+```
+
+## Output File Convention
+
+The plan is written to `docs/plan.md`. No translated variant is generated (`alternative_plan_language` is disabled).
 
 ---
-
 --- Original Design Draft Start ---
 
-# Vector Add CUDA Kernel Optimization — Implementation Plan Draft
+# Vector Addition CUDA Kernel — Implementation Plan Draft
 
-**Task:** High-performance element-wise vector addition CUDA kernel for NVIDIA H100 (SM90).
-**Date:** 2026-06-10
-**Status:** Draft
+## 1. Baseline
 
----
+### 1.1 Current State
 
-## 1. Baseline and Validation Path
+No existing CUDA source code in the workspace. We need to create:
+- A naive baseline kernel (`vector_add_naive.cu`)
+- A CPU reference implementation for correctness validation
+- A benchmarking harness
 
-### 1.1 Problem Definition
-
-Element-wise vector addition: `C[i] = A[i] + B[i]` for all `i ∈ [0, N)`, where A, B, C are FP32 arrays of length N.
-
-**Arithmetic intensity:** 1 FLOP / (3 × 4 bytes) = **0.083 FLOP/byte** — this kernel is purely **memory-bound** on H100.
-
-The performance ceiling is dictated entirely by HBM3 bandwidth (~3.35 TB/s on H100 SXM5). The theoretical peak throughput for this operation (read A, read B, write C = 12 bytes per element) is:
-
-```
-Peak throughput = 3.35 TB/s / 12 bytes/elem ≈ 279 Gelem/s
-Peak GB/s (effective) = 3.35 TB/s × (4 bytes × 3 / 12 bytes) ≈ 3.35 TB/s (total mem traffic)
-```
-
-### 1.2 H100 (SM90) Hardware Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| SMs (SXM5) | 132 |
-| Max threads per SM | 2048 |
-| Max threads per block | 1024 |
-| Warp size | 32 |
-| Max warps per SM | 64 |
-| Max blocks per SM | 32 |
-| Registers per SM | 65536 |
-| L1 / Shared memory per SM | 256 KB (configurable) |
-| L2 cache | 50 MB |
-| HBM3 bandwidth (SXM5) | 3.35 TB/s |
-| L1 cache line | 128 bytes |
-| Memory transaction size | 32 / 64 / 128 bytes |
-
-### 1.3 Baseline Implementation
-
-A naive baseline kernel:
-- Each thread processes **one element** (1 FP32 load from A, 1 from B, 1 store to C).
-- Standard 1D grid with `(N + blockDim.x - 1) / blockDim.x` blocks, 256 threads/block.
-- No vectorized access, no cache hints, no `__launch_bounds__`.
-- Typical throughput: ~30–50% of peak HBM bandwidth due to uncoalesced 32-bit memory transactions and insufficient memory-level parallelism.
-
-### 1.4 Validation Command
-
-```bash
-nvcc -O2 -std=c++17 -arch=sm_90 -lineinfo \
-     vector_add.cu -o vector_add
-./vector_add --validate
-```
-
-Validation checks:
-1. `max|C_gpu[i] - C_cpu[i]| < 1e-3` for all `i`.
-2. No NaN or inf values in GPU output.
-3. All CUDA API calls return success.
-
-### 1.5 Evaluation Command
-
-```bash
-# Warmup + benchmark (10 warmup iterations, 100 timed iterations)
-./vector_add --benchmark --warmup 10 --iterations 100 --size $((1024*1024*256))  # 256M elements = 1 GiB per array
-```
-
-Metrics reported:
-- Average kernel latency (μs)
-- Effective throughput in GB/s (total bytes read+written / latency)
-- Percentage of theoretical HBM bandwidth
-
----
-
-## 2. Main Risks and Unknowns
-
-| Risk | Severity | Mitigation |
-|------|----------|------------|
-| H100 not physically available in CI | High | The validation runtime environment is unknown. Kernel compiles for sm_90; if no H100 GPU is present, evaluation relies on theoretical analysis and Nsight Compute estimates. |
-| Vectorized loads exceed alignment requirements | Medium | Use `__align__(16)` for float4; validate alignment at runtime. Misaligned pointers cause multiple narrower transactions. |
-| Register spilling from aggressive unrolling | Medium | Profile with `-Xptxas -v` to check register usage; use `__launch_bounds__` and `-maxrregcount` as needed. |
-| Tail elements (N not multiple of vector width) | Low | Handle with a clean-up loop for remaining elements after the vectorized main loop. |
-| Implicit L2 caching hides L1 bypass benefits | Low | On streaming access patterns, L1::no_allocate reduces L1 pollution and frees cache for other warps' in-flight loads. The benefit is measurable on H100's 256 KB L1/SMEM. |
-| Float4 store might be slower than float4 load | Low | Profile both. On H100, store throughput matches load throughput for aligned vectorized accesses. |
-
----
-
-## 3. Candidate Implementation Directions
-
-Ranked by expected value × confidence / risk:
-
-### Candidate 1: Vectorized float4 Load/Store (High value, Low risk)
-
-**Technique:** Replace per-element 32-bit loads with 128-bit float4 loads and stores. Each thread processes 4 elements per iteration instead of 1.
-
-- `float4` loads: 16 bytes per instruction (4 float elements)
-- Reduces instruction count by ~4×, saturates memory bus more efficiently
-- Grid: `(N/4 + blockDim.x - 1) / blockDim.x` blocks
-
-**Expected improvement:** 1.5–3× over baseline.
-**Risk:** Minimal — alignment requirement is 16 bytes, easily satisfied by `cudaMalloc`.
-
-### Candidate 2: Cache Policy Hints (Medium value, Low risk)
-
-**Technique:** Apply `L1::no_allocate` streaming hint to all three arrays via PTX inline assembly. All three arrays are streaming (no data reuse), so L1 caching is wasteful.
+### 1.2 Naive Baseline Design
 
 ```cuda
-// PTX inline for vec4 load with L1 bypass
+__global__ void vector_add_naive(const float* A, const float* B, float* C, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        C[idx] = A[idx] + B[idx];
+    }
+}
+```
+
+Configured with 256 threads/block, grid sized to cover N elements. This represents the standard naive approach — one element per thread, standard 32-bit loads/stores.
+
+### 1.3 Validation and Evaluation
+
+**Validation command:**
+```bash
+nvcc -arch=sm_90 -O3 vector_add.cu -o vector_add && ./vector_add
+```
+The program outputs "PASS" or "FAIL" with max absolute error. All elements must match CPU reference within 1e-3 absolute tolerance.
+
+**Evaluation command:**
+```bash
+nvcc -arch=sm_90 -O3 vector_add.cu -o vector_add && ./vector_add --benchmark
+```
+Runs 5 warm-up iterations + 20 timed iterations, reports average kernel latency (ms) and effective throughput (GB/s).
+
+### 1.4 Expected Baseline Performance
+
+For FP32 element-wise addition (N = 2^28 ≈ 268M elements, ~3.2 GB total), the theoretical lower bound is:
+- Data transferred: 2 reads (A, B) + 1 write (C) = 12 bytes per element
+- For N=268M elements: 12 × 268M = 3.22 GB
+- At H100 peak bandwidth (3.35 TB/s): ~0.96 ms minimum
+- Naive kernel with 32-bit loads: expect 60-70% of peak → ~1.4-1.6 ms → ~2000-2300 GB/s
+
+## 2. Key Characteristics
+
+### 2.1 Arithmetic Intensity
+
+Vector addition is **deeply memory-bound**:
+- Reads: 8 bytes/element (A[i] + B[i] in FP32)
+- Writes: 4 bytes/element (C[i] in FP32)
+- Compute: 1 FLOP/element (single addition)
+- Arithmetic intensity: 1 FLOP / 12 bytes ≈ **0.083 FLOPs/byte**
+
+The H100 roofline knee is at ~20 FLOPs/byte (67 TFLOPS / 3.35 TB/s). At 0.083 FLOPs/byte, the kernel operates deep in the memory-bound regime. **Compute optimizations will have zero benefit** — the entire optimization strategy must focus on memory bandwidth utilization.
+
+### 2.2 H100 Hardware Reference
+
+| Parameter | Value |
+|---|---|
+| Peak HBM3 bandwidth | 3.35 TB/s (SXM) |
+| L2 cache | 50 MB |
+| SMs | 132 |
+| Max threads/SM | 2048 |
+| Max blocks/SM | 32 |
+| Max registers/SM | 65536 |
+| Max shared memory/SM | 228 KB |
+| Max threads per block | 1024 |
+| Warp size | 32 |
+
+### 2.3 Speed-of-Light Calculation
+
+For N = 2^28 elements (1 GB per vector, 3 GB total I/O):
+- **Theoretical minimum**: 3.0 GB / 3.35 TB/s ≈ **0.90 ms**
+- Corresponding throughput: **3,352 GB/s**
+
+No kernel can exceed this. A well-optimized kernel should achieve 80-90% of peak (2,680-3,017 GB/s).
+
+## 3. Risks and Unknowns
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| H100 memory controller saturation — 128-bit loads may not fully saturate due to L2 bandwidth limits | Medium | Try 128-bit and compare with 64-bit; measure with Nsight Compute |
+| L1 cache line eviction — streaming access pattern may not benefit from L1 caching | Low | Use `L1::no_allocate` cache hint for all streams |
+| Register spill from vectorized loads (float4) consumes more registers | Low | Use `-maxrregcount` to balance; 32-40 regs/thread is sufficient |
+| Block size too small → insufficient occupancy to hide latency | Medium | Grid stride loop (multi-element per thread) to keep occupancy high with fewer blocks |
+| Launch overhead for small N | Low | Not in scope; benchmark at large N (2^28) |
+| Misaligned addresses cause split transactions | Low | Use `cudaMalloc` which returns 256-byte aligned memory |
+
+## 4. Candidate Implementation Directions
+
+Ranked by expected value (throughput improvement over naive) and risk:
+
+### Candidate 1: Vectorized Memory Access (float4)
+
+**Expected improvement:** High (~1.5-2x bandwidth utilization gain)
+**Risk:** Low
+**Description:** Replace scalar float loads/stores with `float4` (128-bit) vectorized loads/stores. Each thread processes 4 elements instead of 1, issuing 4x fewer memory transactions. This is the single most impactful change for a memory-bound kernel.
+
+```cuda
+// Key optimization: float4 loads/stores
+float4 a_vec = reinterpret_cast<const float4*>(A)[idx];
+float4 b_vec = reinterpret_cast<const float4*>(B)[idx];
+float4 c_vec;
+c_vec.x = a_vec.x + b_vec.x;
+c_vec.y = a_vec.y + b_vec.y;
+c_vec.z = a_vec.z + b_vec.z;
+c_vec.w = a_vec.w + b_vec.w;
+reinterpret_cast<float4*>(C)[idx] = c_vec;
+```
+
+**Validation:** Compare output with CPU reference. Vectorized kernel should produce identical results to naive (same FP32 operations, just batched).
+
+### Candidate 2: Cache Policy + Multi-element Per Thread
+
+**Expected improvement:** Medium (~1.1-1.3x over Candidate 1)
+**Risk:** Low  
+**Description:** Use `L1::no_allocate` cache hint via PTX inline assembly for all global memory loads. The vector addition kernel has no data reuse (each element read once), so L1 caching is counterproductive — it evicts potentially useful data and adds latency. Combine with processing multiple float4 chunks per thread (grid-stride loop) to amortize launch overhead and improve occupancy.
+
+```cuda
+// PTX with L1::no_allocate for streaming access
 asm volatile(
     "ld.global.L1::no_allocate.v4.f32 {%0,%1,%2,%3}, [%4];"
     : "=f"(a.x), "=f"(a.y), "=f"(a.z), "=f"(a.w)
-    : "l"(ptr_a)
-);
+    : "l"(ptr_a));
 ```
 
-**Expected improvement:** 5–15% over vectorized-only baseline, per KernelWiki data on memory-bound kernels.
-**Risk:** Low. PTX inline assembly is well-documented for H100.
+### Candidate 3: Tuned Block Size + Register Budgeting
 
-### Candidate 3: 256-bit (uint4/float4×2) Loads + ILP (Medium-High value, Medium risk)
+**Expected improvement:** Small-Medium (~1.05-1.15x over Candidate 2)
+**Risk:** Low
+**Description:** Sweep block sizes (128, 256, 512, 1024) and register limits (32, 40, 48, 56, 64) to find optimal occupancy configuration. For memory-bound kernels, higher occupancy helps hide memory latency. Use `__launch_bounds__` and `-maxrregcount`.
 
-**Technique:** Each thread processes 8 elements per iteration using two back-to-back float4 loads (instruction-level parallelism). This doubles the in-flight memory transactions per thread, hiding memory latency better.
+### Candidate 4: 256-bit Loads (v4.u64)
 
-```cuda
-float4 a0, a1, b0, b1;
-// ILP: interleave loads from A and B to maximize memory-level parallelism
-a0 = *((float4*)a_ptr + idx);
-b0 = *((float4*)b_ptr + idx);
-a1 = *((float4*)a_ptr + idx + 1);
-b1 = *((float4*)b_ptr + idx + 1);
-```
+**Expected improvement:** Small (~1.0-1.05x over Candidate 2)
+**Risk:** Medium — requires 32-byte alignment, may not improve over 128-bit if already saturating memory bus
+**Description:** Use 256-bit loads (`ld.global.v4.u64`) to issue even wider memory transactions. This may help on H100's memory subsystem but benefits diminish beyond 128-bit for simple kernels.
 
-**Expected improvement:** 10–30% over Candidate 1 on large vectors.
-**Risk:** Increases register pressure (needs ~16 registers for 8 float values). Profile for spills.
+## 5. First Implementation Steps
 
-### Candidate 4: Occupancy Tuning with __launch_bounds__ and Block Size (Medium value, Low risk)
+1. **Create the unified CUDA source file** (`vector_add.cu`) containing:
+   - CPU reference function
+   - Validation harness (check results, report max error)
+   - Benchmark harness (warm-up iterations, timed iterations, throughput calculation)
+   - Naive baseline kernel
+   
+2. **Compile and run baseline** to establish reference performance numbers.
 
-**Technique:** Use `__launch_bounds__` to inform the compiler of expected thread count. Tune block size (128/256/512/1024) to maximize occupancy. On H100 with 2048 max threads/SM, 256-thread blocks allow 8 blocks/SM; 128-thread blocks allow 16 blocks/SM.
+3. **Implement Candidate 1 (float4 vectorization)** and validate correctness.
 
-**Expected improvement:** 0–20% depending on baseline occupancy.
-**Risk:** Low — `__launch_bounds__` is a compiler hint; worst case is no improvement.
+4. **Implement Candidate 2 (cache policy + grid-stride loop)** and benchmark.
 
-### Candidate 5: Multi-Dimensional Grid for Very Large Vectors (Low value, Low risk)
+5. **Implement Candidate 3 (tune block size + register count)** and benchmark.
 
-**Technique:** Use 2D/3D grid to avoid integer overflow in 1D grid for N > 2^31. Not strictly an optimization but ensures correctness for large vectors.
+6. **Optionally implement Candidate 4 (256-bit loads)** if bandwidth saturation is not achieved.
 
-**Expected improvement:** Correctness fix only.
-**Risk:** Minimal.
+## 6. Exact Commands
 
-### Candidate 6: Cooperative Groups / Async Copy (Exploratory, Low-Medium value, Medium risk)
-
-**Technique:** Use `cuda::memcpy_async` or cooperative groups for potential overlap of computation and memory access. For a pure element-wise kernel with zero compute, this is unlikely to help.
-
-**Expected improvement:** Minimal for pure memory-bound element-wise ops.
-**Risk:** Added complexity; async copy pipeline requires shared memory staging, which reduces occupancy.
-
----
-
-## 4. Recommended Implementation Sequence
-
-1. **Create the full harness** (`vector_add.cu`) with CPU reference, validation, and benchmark infrastructure.
-2. **Implement naive baseline** — 32-bit per-element kernel, 256 threads/block.
-3. **Implement Candidate 1** — float4 vectorization (128-bit loads/stores).
-4. **Implement Candidate 2** — Add L1 cache policy hints on top of Candidate 1.
-5. **Implement Candidate 3** — 2× float4 ILP on top of Candidate 2.
-6. **Implement Candidate 4** — Occupancy tuning (test block sizes 128/256/512).
-
-Each candidate is validated for correctness before benchmarking.
-
----
-
-## 5. First Concrete Implementation Steps
-
-### Step 1: Write the harness and naive baseline
-
-File: `vector_add.cu`
-
-Structure:
-```
-vector_add.cu
-├── #include <cuda_runtime.h>, <stdio.h>, <stdlib.h>, <math.h>, <chrono>
-├── CUDA_CHECK macro
-├── CPU reference: vector_add_cpu(float* C, const float* A, const float* B, size_t N)
-├── Naive GPU kernel: vector_add_naive<<<...>>>
-├── Validation: validate(C_gpu, C_cpu, N) → max absolute error
-├── Benchmark: benchmark(kernel, args, warmup_iters, bench_iters) → avg_time_us, gb_s
-├── main(): --validate | --benchmark | --size N
-└── Makefile or compile notes
-```
-
-### Step 2: Compile and validate
-
+### Validation
 ```bash
-nvcc -O2 -std=c++17 -arch=sm_90 -lineinfo vector_add.cu -o vector_add
-./vector_add --validate
+nvcc -arch=sm_90 -O3 -lineinfo vector_add.cu -o vector_add && ./vector_add
 ```
 
-### Step 3: Benchmark baseline
-
+### Evaluation (Benchmark)
 ```bash
-./vector_add --benchmark --warmup 10 --iterations 100 --size 268435456
+nvcc -arch=sm_90 -O3 -lineinfo vector_add.cu -o vector_add && ./vector_add --benchmark
 ```
 
-### Step 4: Iterate through candidates 1→4
-
-After each candidate, re-run validation and benchmark. Record results.
-
----
-
-## 6. Validation and Evaluation Commands
-
-### Validation (correctness only)
-
+### Performance Counters (Nsight Compute)
 ```bash
-nvcc -O2 -std=c++17 -arch=sm_90 -lineinfo vector_add.cu -o vector_add
-./vector_add --validate --size 16777216    # 64 MiB per array
-./vector_add --validate --size 268435456   # 1 GiB per array
-./vector_add --validate --size 1048577     # Non-multiple of 4 (tests tail handling)
+ncu --metrics gpu__time_duration.sum,l1tex__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed ./vector_add
 ```
 
-### Evaluation (performance)
+## 7. Promotion Criteria
 
-```bash
-# Large vector benchmark
-./vector_add --benchmark --warmup 10 --iterations 100 --size 268435456
+### Evidence Required to Promote a Candidate
 
-# Medium vector benchmark
-./vector_add --benchmark --warmup 10 --iterations 100 --size 16777216
+| Criterion | Threshold |
+|---|---|
+| Correctness | All elements match CPU reference within 1e-3 absolute tolerance. No NaN, no inf. |
+| Stability | Passes validation 100% of the time across 5 repeated runs |
+| Performance | Clear improvement in effective throughput (GB/s) vs. naive baseline |
+| Resource utilization | Achieved occupancy ≥ 50% on H100; memory throughput ≥ 70% of peak |
 
-# Optional: Nsight Compute profiling (if H100 is available)
-ncu --set full --kernel-name regex:vector_add ./vector_add --benchmark --size 16777216
-```
+### Evidence Required to Revise
 
----
+- Performance regression or no improvement vs. best prior candidate
+- Correctness failure
+- Degraded occupancy without compensating throughput gain
 
-## 7. Promotion / Revision / Rejection Criteria
+### Evidence Required to Reject
 
-### Promote (accept candidate)
-- All validation checks pass (max error < 1e-3, no NaN/inf).
-- Kernel latency is measurably lower than naive baseline (≥1.2× speedup).
-- Effective bandwidth ≥ 60% of theoretical HBM peak.
-- Candidate is stable across ≥3 sizes (medium: 16M, large: 256M, odd: 16M+1).
+- Candidate is fundamentally broken (e.g., uses shared memory for streaming data, tries tensor cores for element-wise ops)
+- Candidate produces worse results than all prior candidates with no path to improvement
+- Candidate relies on unavailable hardware features or breaks the task contract
 
-### Revise (iterate on candidate)
-- Validation passes but performance is within 10% of baseline.
-- Performance improves but correctness fails — debug the vectorization or tail logic.
-- Effective bandwidth is below 40% of peak — check occupancy, alignment, or cache policy.
+## 8. Expected Final Performance
 
-### Reject (discard direction)
-- Candidate produces incorrect results that cannot be fixed without abandoning the technique.
-- Performance is worse than baseline (e.g., due to register spilling or cache thrashing).
-- Complexity is too high for marginal gain (e.g., < 5% improvement with significantly more code).
+A fully optimized FP32 vector addition kernel on H100 should achieve:
+- **Throughput:** 2,500-2,900 GB/s (75-87% of peak 3,352 GB/s)
+- **Latency (N=2^28):** ~1.05-1.20 ms
+- **Key optimization levers:** float4 vectorization, L1 cache bypass, multi-element per thread, optimal block size + register count
 
----
-
-## 8. Expected Performance Progression
-
-| Stage | Expected Bandwidth* | Expected Speedup |
-|-------|-------------------|-----------------|
-| Naive baseline | ~600–900 GB/s | 1.0× |
-| + float4 vectorization | ~1.5–2.0 TB/s | 1.5–2.5× |
-| + L1 cache policy | ~1.8–2.5 TB/s | 1.1–1.2× over prev |
-| + ILP (2× float4) | ~2.2–2.8 TB/s | 1.1–1.2× over prev |
-| + Occupancy tuning | ~2.3–3.0 TB/s | 1.0–1.1× over prev |
-
-*Effective bandwidth of total memory traffic (read A + read B + write C). Theoretical peak for H100 SXM5 is 3.35 TB/s.
-
----
-
-## References
-
-- KernelWiki: `technique-vectorized-loads` — Wide Vectorized Loads and Cache Policies (NVFP4 GEMV optimization progression: 2000μs → 22.4μs, 89× improvement through vectorization + cache policy + register tuning)
-- KernelWiki: `technique-cache-policy` — PTX Cache Policy Differentiation (L1::no_allocate, L1::evict_last) for streaming vs reused data
-- NVIDIA H100 white paper / CUDA Programming Guide SM90
-- CUDA C++ Best Practices Guide — Memory coalescing and vectorized access patterns
+The gap to 100% of peak bandwidth (~0.90 ms) comes from: instruction dispatch overhead, L2 cache tag lookups, DRAM page activation latency, and the fact that vector addition has 3 separate memory streams (A read, B read, C write) which limits the achievable fraction of peak DRAM utilization.
 
 --- Original Design Draft End ---
